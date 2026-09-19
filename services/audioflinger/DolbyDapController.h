@@ -83,6 +83,10 @@ public:
 
     status_t skipHardBypass() EXCLUDES_EffectChain_Mutex;
 
+    // Dumps a nonblocking bookkeeping snapshot. Never queries the HAL or
+    // acquires an effect/chain lock; fd writes happen after releasing mMutex.
+    void dump(int fd) const;
+
 private:
     DolbyDapController() = default;
 

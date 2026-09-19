@@ -937,6 +937,7 @@ status_t AudioFlinger::dump(int fd, const Vector<String16>& args)
         }
 
         dumpInternals_l(fd);
+        DolbyDapController::getInstance().dump(fd);
 
         dprintf(fd, "\n ## BEGIN thread dump \n");
         // dump playback threads

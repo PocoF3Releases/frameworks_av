@@ -16,6 +16,8 @@
 #include <cstring>
 #include <cmath>
 #include <limits>
+#include <cstdio>
+#include <sstream>
 #include <utility>
 
 namespace android {
@@ -551,6 +553,47 @@ void DolbyDapController::updateAudioTracks(audio_io_handle_t io, ActiveTrackStat
         ALOGW("%s: DAP flags %#x failed %d, attempt %u", __func__, flags, status,
                 mAudioFlagsFailures);
     }
+}
+
+void DolbyDapController::dump(int fd) const {
+    char control[PROPERTY_VALUE_MAX] = {};
+    char version[PROPERTY_VALUE_MAX] = {};
+    property_get(kDolbyControlProperty, control, "none");
+    property_get(kDolbyVersionProperty, version, "unset");
+    std::ostringstream output;
+    output << "\nDolby DAP controller (bookkeeping; not DSP readback):\n"
+           << "  support=" << property_get_bool(kDolbySupportProperty, false)
+           << " control=" << control << " version=" << version << "\n";
+    {
+        std::unique_lock lock(mMutex, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            output << "  state busy; retry the dump\n";
+        } else {
+            output << "  captured=" << (mEffect != nullptr) << " io=" << mEffectIo
+                   << " targetOffloaded=" << mTargetOffloaded
+                   << " attachmentAcknowledged=" << (mSyncedCallback != nullptr)
+                   << " lastObservedEnabled=" << mLastEnabled << "\n"
+                   << "  attachmentFailures=" << mAttachmentFailures
+                   << " volumeOutputs=" << mOutputVolumes.size()
+                   << " metadataOutputs=" << mOutputAudioFlags.size()
+                   << " metadataFailures=" << mAudioFlagsFailures << "\n";
+            const auto printGain = [&](const char* name, uint32_t acknowledged,
+                                       const PregainRetryState& retry) {
+                output << "  pregain[" << name << "]: desired=";
+                if (retry.desired) output << *retry.desired;
+                else output << "none";
+                output << " acknowledged=" << acknowledged << " status=" << retry.lastStatus
+                       << " failures=" << retry.failures
+                       << " retryExhausted=" << (retry.failures > kAttachmentRetryNs.size())
+                       << "\n";
+            };
+            printGain("scalar", mLastScalarPregain, mScalarPregainRetry);
+            printGain("deep-buffer", mLastDeepBufferPregain, mDeepBufferPregainRetry);
+            printGain("direct", mLastDirectPregain, mDirectPregainRetry);
+            printGain("offload", mLastOffloadPregain, mOffloadPregainRetry);
+        }
+    }
+    dprintf(fd, "%s", output.str().c_str());
 }
 
 status_t DolbyDapController::skipHardBypass() {
