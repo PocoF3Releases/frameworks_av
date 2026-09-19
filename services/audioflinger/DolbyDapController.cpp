@@ -109,6 +109,21 @@ bool DolbyDapController::isCurrentEffect_l(const EffectSnapshot& snapshot) const
     return mEffect == snapshot.effect;
 }
 
+DolbyDapController::PregainRetryState& DolbyDapController::pregainRetryState_l(
+        bool scalar, audio_output_flags_t flag) {
+    if (scalar) return mScalarPregainRetry;
+    if (flag == AUDIO_OUTPUT_FLAG_DEEP_BUFFER) return mDeepBufferPregainRetry;
+    if (flag == AUDIO_OUTPUT_FLAG_DIRECT) return mDirectPregainRetry;
+    return mOffloadPregainRetry;
+}
+
+void DolbyDapController::resetPregainRetries_l() {
+    mScalarPregainRetry = {};
+    mDeepBufferPregainRetry = {};
+    mDirectPregainRetry = {};
+    mOffloadPregainRetry = {};
+}
+
 void DolbyDapController::resetAttachmentState_l(audio_io_handle_t io) {
     mEffectIo = io;
     mSyncedCallback.clear();
@@ -126,6 +141,7 @@ void DolbyDapController::resetAttachmentState_l(audio_io_handle_t io) {
     mLastDeepBufferPregain = 0;
     mLastDirectPregain = 0;
     mLastOffloadPregain = 0;
+    resetPregainRetries_l();
     ++mGeneration;
 }
 
@@ -206,6 +222,7 @@ void DolbyDapController::invalidateOutput(audio_io_handle_t io) {
             mLastDeepBufferPregain = 0;
             mLastDirectPregain = 0;
             mLastOffloadPregain = 0;
+            resetPregainRetries_l();
             ++mGeneration;
         }
         if (mOutputAudioFlags.erase(io) != 0) ++mAudioFlagsGeneration;
@@ -283,6 +300,7 @@ bool DolbyDapController::observeEnabled_l(const EffectSnapshot& snapshot) {
             mLastDeepBufferPregain = 0;
             mLastDirectPregain = 0;
             mLastOffloadPregain = 0;
+            resetPregainRetries_l();
             ++mGeneration;
         } else if (!mLastEnabled) {
             // A real app-controlled OFF -> ON transition renews a failed
@@ -319,6 +337,7 @@ void DolbyDapController::updatePregain(
                 mLastDeepBufferPregain = 0;
                 mLastDirectPregain = 0;
                 mLastOffloadPregain = 0;
+                resetPregainRetries_l();
             }
             ++mGeneration;
         }
@@ -390,7 +409,15 @@ void DolbyDapController::updatePregain(
                 : pregainFlag == AUDIO_OUTPUT_FLAG_DEEP_BUFFER ? mLastDeepBufferPregain
                 : pregainFlag == AUDIO_OUTPUT_FLAG_DIRECT
                         ? mLastDirectPregain : mLastOffloadPregain;
-        if (combinedVolume == lastPregain) {
+        auto& retry = pregainRetryState_l(scalarPregain, pregainFlag);
+        if (retry.desired != combinedVolume) {
+            // Only a different requested gain, a real route/enable transition,
+            // or retirement/restart renews a failed command's retry budget.
+            retry = {};
+            retry.desired = combinedVolume;
+        }
+        if (combinedVolume == lastPregain || retry.failures > kAttachmentRetryNs.size()
+                || systemTime(SYSTEM_TIME_MONOTONIC) < retry.nextAttemptNs) {
             return;
         }
         generation = mGeneration;
@@ -402,12 +429,9 @@ void DolbyDapController::updatePregain(
             ? setParam(effect, kParamSetPregain, static_cast<int32_t>(combinedVolume))
             : setParameters(effect, kParamSetPregain,
                     {static_cast<int32_t>(combinedVolume), static_cast<int32_t>(pregainFlag)});
-    if (status != NO_ERROR) {
-        return;
-    }
-
     std::lock_guard lock(mMutex);
     if (mEffect != effect) return;
+    auto& retry = pregainRetryState_l(scalarPregain, pregainFlag);
     if (mGeneration != generation) {
         // A zero-volume retirement can run before it waits for our chain lock.
         // The command just reached the HAL with a now-obsolete maximum. An
@@ -416,8 +440,32 @@ void DolbyDapController::updatePregain(
         mLastDeepBufferPregain = 0;
         mLastDirectPregain = 0;
         mLastOffloadPregain = 0;
+        retry = {};
         return;
     }
+    retry.lastStatus = status;
+    if (status != NO_ERROR) {
+        // A transport failure can lose the reply after the vendor applied the
+        // request. The previous ACK cannot prove the current hardware value.
+        if (scalarPregain) mLastScalarPregain = 0;
+        else if (pregainFlag == AUDIO_OUTPUT_FLAG_DEEP_BUFFER) mLastDeepBufferPregain = 0;
+        else if (pregainFlag == AUDIO_OUTPUT_FLAG_DIRECT) mLastDirectPregain = 0;
+        else mLastOffloadPregain = 0;
+        ++retry.failures;
+        if (retry.failures <= kAttachmentRetryNs.size()) {
+            retry.nextAttemptNs = systemTime(SYSTEM_TIME_MONOTONIC)
+                    + kAttachmentRetryNs[retry.failures - 1];
+        }
+        // Pregain is independent of attachment and optional metadata. Do not
+        // disable DAP, invent an ACK, or hammer the HAL on every mixer period.
+        ALOGW("%s: DAP io %d pregain %#x flag %#x failed %d, attempt %u%s",
+                __func__, dapIo, combinedVolume, pregainFlag, status, retry.failures,
+                retry.failures > kAttachmentRetryNs.size()
+                        ? " (waiting for a new gain or route event)" : "");
+        return;
+    }
+    retry.failures = 0;
+    retry.nextAttemptNs = 0;
     if (scalarPregain) {
         // The QDSP parameter is global: an ACK from another output class
         // supersedes the previous value too. Never use three class-local ACKs.

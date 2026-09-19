@@ -137,6 +137,19 @@ private:
     unsigned mAudioFlagsFailures = 0;
     int64_t mNextAudioFlagsAttemptNs = 0;
 
+    struct PregainRetryState {
+        std::optional<uint32_t> desired;
+        unsigned failures = 0;
+        int64_t nextAttemptNs = 0;
+        status_t lastStatus = NO_ERROR;
+    };
+    PregainRetryState& pregainRetryState_l(bool scalar, audio_output_flags_t flag);
+    void resetPregainRetries_l();
+    PregainRetryState mScalarPregainRetry;
+    PregainRetryState mDeepBufferPregainRetry;
+    PregainRetryState mDirectPregainRetry;
+    PregainRetryState mOffloadPregainRetry;
+
     uint32_t mLastScalarPregain = 0;
     uint32_t mLastDeepBufferPregain = 0;
     uint32_t mLastDirectPregain = 0;
