@@ -201,6 +201,7 @@ cc_library {
         "AudioFlinger.cpp",
         "Client.cpp",
         "DeviceEffectManager.cpp",
+        "DolbyDapController.cpp",
         "Effects.cpp",
         "MelReporter.cpp",
         "PatchCommandThread.cpp",

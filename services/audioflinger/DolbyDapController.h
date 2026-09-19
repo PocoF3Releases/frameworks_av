@@ -1,0 +1,99 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#pragma once
+
+#include "IAfEffect.h"
+#include "IAfThread.h"
+
+#include <media/AudioContainers.h>
+
+#include <map>
+#include <mutex>
+#include <optional>
+#include <vector>
+
+namespace android {
+
+/**
+ * Synchronizes the global Dolby DAP effect with AudioFlinger state.
+ *
+ * Product-selected effect contracts distinguish the preserved QDSP binary
+ * (standard I/O/offload command and scalar pregain) from the newer legacy
+ * reference (private I/O, two-word pregain and track attributes). A DAX version
+ * or HAL version does not imply support for either private protocol.
+ * Optional sound-type bypass is not app VoIP policy and is not enabled here.
+ */
+class DolbyDapController final {
+public:
+    static DolbyDapController& getInstance();
+
+    // Only the output-mix DAP belongs to this controller. Per-session DAP
+    // movement must not issue skip-hard-bypass on an unrelated global effect.
+    static bool isSupported();
+    static bool isDapEffect(const sp<IAfEffectModule>& effect);
+
+    void effectCreated(
+            const sp<IAfEffectModule>& effect,
+            audio_io_handle_t io,
+            IAfThreadBase::type_t threadType,
+            const DeviceTypeSet& devices) EXCLUDES_EffectChain_Mutex;
+    void effectReleased(const sp<IAfEffectModule>& effect)
+            REQUIRES(audio_utils::EffectChain_Mutex);
+
+    void updateOffload(
+            audio_io_handle_t io,
+            IAfThreadBase::type_t threadType,
+            const DeviceTypeSet& devices) EXCLUDES_EffectChain_Mutex;
+
+    // A failed/released patch has no confirmed route. Do not retain its I/O ACK.
+    void invalidateOutput(audio_io_handle_t io) EXCLUDES_EffectChain_Mutex;
+
+    status_t skipHardBypass() EXCLUDES_EffectChain_Mutex;
+
+private:
+    DolbyDapController() = default;
+
+    bool usesQdspControlPath() const;
+    struct EffectSnapshot {
+        sp<IAfEffectModule> effect;
+        sp<EffectCallbackInterface> callback;
+        sp<IAfEffectChain> chain;
+    };
+
+    EffectSnapshot currentEffect() const;
+    bool isCurrentEffect_l(const EffectSnapshot& snapshot) const
+            REQUIRES(audio_utils::EffectChain_Mutex);
+    bool syncAttachment_l(const EffectSnapshot& snapshot)
+            REQUIRES(audio_utils::EffectChain_Mutex) EXCLUDES_EffectBase_Mutex;
+    // Bookkeeping only; caller holds mMutex, never an effect command.
+    void resetAttachmentState_l(audio_io_handle_t io);
+
+    status_t setParam(
+            const sp<IAfEffectModule>& effect,
+            int32_t paramId,
+            int32_t value) const
+            REQUIRES(audio_utils::EffectChain_Mutex) EXCLUDES_EffectBase_Mutex;
+    status_t setParameters(
+            const sp<IAfEffectModule>& effect,
+            int32_t paramId,
+            const std::vector<int32_t>& values) const
+            REQUIRES(audio_utils::EffectChain_Mutex) EXCLUDES_EffectBase_Mutex;
+
+    // Never acquire a chain/effect lock or call the HAL while holding mMutex.
+    // Commands follow ThreadBase (if held) -> EffectChain -> EffectBase.
+    mutable std::mutex mMutex;
+    sp<IAfEffectModule> mEffect;
+
+    sp<EffectCallbackInterface> mSyncedCallback;
+    sp<EffectCallbackInterface> mTargetCallback;
+    bool mTargetOffloaded = false;
+    bool mLastEnabled = false;
+    unsigned mAttachmentFailures = 0;
+    int64_t mNextAttachmentAttemptNs = 0;
+    audio_io_handle_t mEffectIo = AUDIO_IO_HANDLE_NONE;
+
+};
+
+}  // namespace android

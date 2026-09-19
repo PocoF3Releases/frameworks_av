@@ -25,6 +25,7 @@
 
 #include "Configuration.h"
 #include "AudioFlinger.h"
+#include "DolbyDapController.h"
 
 #include <afutils/FallibleLockGuard.h>
 #include <afutils/NBAIO_Tee.h>
@@ -4796,6 +4797,12 @@ status_t AudioFlinger::moveEffectChain_ll(audio_session_t sessionId,
     // process effects one by one.
     for (sp<IAfEffectModule> effect = chain->getEffectFromId_l(0); effect != nullptr;
             effect = chain->getEffectFromId_l(0)) {
+        auto& dolby = DolbyDapController::getInstance();
+        if (DolbyDapController::isDapEffect(effect)
+                && effect->isOffloadable() && effect->isEnabled()) {
+            dolby.skipHardBypass();
+        }
+
         if (srcThread != nullptr) {
             srcThread->removeEffect_l(effect);
         } else {

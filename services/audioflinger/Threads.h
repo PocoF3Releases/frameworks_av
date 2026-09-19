@@ -1575,6 +1575,9 @@ protected:
     mixer_state mMixerStatus GUARDED_BY(ThreadBase_ThreadLoop); // current cycle
                                                   // previous cycle when in prepareTracks_l()
     mixer_state mMixerStatusIgnoringFastTracks GUARDED_BY(ThreadBase_ThreadLoop);
+
+    // Only a HAL-acknowledged output patch may contribute Dolby metadata/gain.
+    bool mDolbyRouteReady GUARDED_BY(audio_utils::ThreadBase_Mutex) = false;
                                                   // FIXME or a separate ready state per track
 
     // FIXME move these declarations into the specific sub-class that needs them

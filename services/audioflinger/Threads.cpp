@@ -24,6 +24,7 @@
 #include "Threads.h"
 
 #include "Client.h"
+#include "DolbyDapController.h"
 #include "IAfEffect.h"
 #include "MelReporter.h"
 #include "ResamplerBufferProvider.h"
@@ -1722,6 +1723,10 @@ sp<IAfEffectHandle> ThreadBase::createEffect_l(
         if (lStatus == OK) {
             lStatus = effect->addHandle(handle.get());
             sendCheckOutputStageEffectsEvent_l();
+            if (lStatus == OK && effectCreated) {
+                DolbyDapController::getInstance().effectCreated(
+                        effect, mId, mType, outDeviceTypes_l());
+            }
         }
         if (enabled != NULL) {
             *enabled = (int)effect->isEnabled();
@@ -1872,6 +1877,9 @@ status_t ThreadBase::addEffect_ll(const sp<IAfEffectModule>& effect)
     effect->setInputDevice(inDeviceTypeAddr());
     effect->setMode(mAfThreadCallback->getMode());
     effect->setAudioSource(mAudioSource);
+
+    DolbyDapController::getInstance().updateOffload(
+            mId, mType, outDeviceTypes_l());
 
     return NO_ERROR;
 }
@@ -4300,7 +4308,6 @@ NO_THREAD_SAFETY_ANALYSIS  // manual locking of AudioFlinger
             mMixerStatus = prepareTracks_l(&tracksToRemove);
 
             mActiveTracks.updatePowerState_l(this);
-
             metadataUpdate = updateMetadata_l();
 
             // Acquire a local copy of active tracks with lock (release w/o lock).
@@ -5088,6 +5095,15 @@ status_t PlaybackThread::createAudioPatch_l(const struct audio_patch *patch,
         *handle = AUDIO_PATCH_HANDLE_NONE;
     }
 
+    mDolbyRouteReady = status == NO_ERROR;
+    if (mDolbyRouteReady) {
+        // A device switch can reuse this I/O and effect chain. Re-synchronize
+        // DSP/software routing only after the HAL accepted the new patch.
+        DolbyDapController::getInstance().updateOffload(mId, mType, outDeviceTypes_l());
+    } else {
+        DolbyDapController::getInstance().invalidateOutput(mId);
+    }
+
     // TODO(b/493682418) - Workaround for BT software HALs
     if (isSuspended()) {
         ALOGD("%s: restoring output with newly active patch", __func__);
@@ -5132,6 +5148,8 @@ status_t PlaybackThread::releaseAudioPatch_l(const audio_patch_handle_t handle)
 {
     status_t status = NO_ERROR;
 
+    mDolbyRouteReady = false;
+    DolbyDapController::getInstance().invalidateOutput(mId);
     mPatch = audio_patch{};
     const bool isAnyBt =
             std::any_of(mOutDeviceTypeAddrs.begin(), mOutDeviceTypeAddrs.end(), [](const auto& x) {
@@ -6543,6 +6561,7 @@ PlaybackThread::mixer_state MixerThread::prepareTracks_l(
 
     // if any fast tracks, then status is ready
     mMixerStatusIgnoringFastTracks = mixerStatus;
+
     if (fastTracks > 0) {
         mixerStatus = MIXER_TRACKS_READY;
     }
