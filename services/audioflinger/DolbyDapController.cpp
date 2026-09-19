@@ -25,6 +25,7 @@ constexpr effect_uuid_t kDapTypeUuid = {
         0x46d279d9, 0x9be7, 0x453d, 0x9d7c,
         {0xef, 0x93, 0x7f, 0x67, 0x55, 0x87}};
 
+constexpr int32_t kParamSetPregain = 0x10;
 constexpr int32_t kParamSkipHardBypass = 0x13;
 constexpr int32_t kParamIoHandle = 0x14;
 
@@ -32,6 +33,8 @@ constexpr char kDolbySupportProperty[] = "ro.vendor.audio.dolby.dax.support";
 // This is the effect-binary contract selected by the product, not the audio HAL
 // version. DAX version strings alone do not establish private command support.
 constexpr char kDolbyControlProperty[] = "ro.vendor.audio.dolby.dap.control";
+constexpr char kDolbyVersionProperty[] = "ro.vendor.audio.dolby.dax.version";
+constexpr char kDax36Prefix[] = "DAX3_3.6";
 
 // Playback-driven recovery, not a vendor timing constant. No sleeps or retry
 // worker on the audio thread, and no unbounded command storm on a failed HAL.
@@ -63,6 +66,19 @@ bool DolbyDapController::usesQdspControlPath() const {
     char profile[PROPERTY_VALUE_MAX] = {};
     property_get(kDolbyControlProperty, profile, "none");
     return std::strcmp(profile, "qdsp") == 0;
+}
+
+bool DolbyDapController::usesLegacyDax36ControlPath() const {
+    if (!isSupported()) {
+        return false;
+    }
+
+    char version[PROPERTY_VALUE_MAX] = {};
+    property_get(kDolbyVersionProperty, version, kDax36Prefix);
+    constexpr size_t prefixSize = sizeof(kDax36Prefix) - 1;
+    return std::strncmp(version, kDax36Prefix, prefixSize) == 0
+            && (version[prefixSize] == '\0' || version[prefixSize] == '.'
+                    || version[prefixSize] == '_');
 }
 
 DolbyDapController::EffectSnapshot DolbyDapController::currentEffect() const {
@@ -98,6 +114,12 @@ void DolbyDapController::resetAttachmentState_l(audio_io_handle_t io) {
     mTargetCallback.clear();
     mAttachmentFailures = 0;
     mNextAttachmentAttemptNs = 0;
+    mOutputVolumes.clear();
+    mLastScalarPregain = 0;
+    mLastDeepBufferPregain = 0;
+    mLastDirectPregain = 0;
+    mLastOffloadPregain = 0;
+    ++mGeneration;
 }
 
 void DolbyDapController::effectCreated(
@@ -170,6 +192,16 @@ void DolbyDapController::updateOffload(
 
 void DolbyDapController::invalidateOutput(audio_io_handle_t io) {
     if (!isSupported() || io == AUDIO_IO_HANDLE_NONE) return;
+    {
+        std::lock_guard lock(mMutex);
+        if (mOutputVolumes.erase(io) != 0) {
+            mLastScalarPregain = 0;
+            mLastDeepBufferPregain = 0;
+            mLastDirectPregain = 0;
+            mLastOffloadPregain = 0;
+            ++mGeneration;
+        }
+    }
     const auto snapshot = currentEffect();
     if (snapshot.chain == nullptr) return;
     audio_utils::lock_guard chainLock(snapshot.chain->mutex());
@@ -223,6 +255,174 @@ bool DolbyDapController::syncAttachment_l(const EffectSnapshot& snapshot) {
             __func__, io, offloaded, status, mAttachmentFailures,
             mAttachmentFailures > kAttachmentRetryNs.size() ? " (waiting for a new event)" : "");
     return false;
+}
+
+bool DolbyDapController::observeEnabled_l(const EffectSnapshot& snapshot) {
+    const auto& effect = snapshot.effect;
+    const bool enabled = effect->isEnabled();
+    {
+        std::lock_guard lock(mMutex);
+        if (mEffect != effect) return false;
+        if (!enabled) {
+            mOutputVolumes.clear();
+            mLastScalarPregain = 0;
+            mLastDeepBufferPregain = 0;
+            mLastDirectPregain = 0;
+            mLastOffloadPregain = 0;
+            ++mGeneration;
+        } else if (!mLastEnabled) {
+            // A real app-controlled OFF -> ON transition renews a failed
+            // attachment's budget. A render-period retry never renews it.
+            mAttachmentFailures = 0;
+            mNextAttachmentAttemptNs = 0;
+        }
+        mLastEnabled = enabled;
+    }
+    return enabled;
+}
+
+void DolbyDapController::updatePregain(
+        IAfThreadBase::type_t threadType,
+        audio_io_handle_t io,
+        audio_output_flags_t flags,
+        uint32_t maxVolume) {
+    if (!isSupported() || io == AUDIO_IO_HANDLE_NONE
+            || (threadType != IAfThreadBase::MIXER
+                    && threadType != IAfThreadBase::DIRECT
+                    && threadType != IAfThreadBase::OFFLOAD)) {
+        return;
+    }
+
+    if (maxVolume == 0) {
+        // A source thread may stop after DAP has moved elsewhere. Retire its
+        // contribution before checking whether it may still send DAP commands.
+        std::lock_guard lock(mMutex);
+        if (mOutputVolumes.erase(io) != 0) {
+            if (mOutputVolumes.empty()) {
+                // Keep stock's no-zero-write rule, but do not let an old ACK
+                // suppress a same-volume restart after idle/standby.
+                mLastScalarPregain = 0;
+                mLastDeepBufferPregain = 0;
+                mLastDirectPregain = 0;
+                mLastOffloadPregain = 0;
+            }
+            ++mGeneration;
+        }
+    }
+
+    const auto snapshot = currentEffect();
+    if (snapshot.chain == nullptr) {
+        return;
+    }
+    audio_utils::lock_guard chainLock(snapshot.chain->mutex());
+    if (!isCurrentEffect_l(snapshot)) {
+        return;
+    }
+    const auto& effect = snapshot.effect;
+    const bool enabled = observeEnabled_l(snapshot);
+    if (!syncAttachment_l(snapshot) || !enabled || !usesLegacyDax36ControlPath()
+            || (flags & AUDIO_OUTPUT_FLAG_FAST) != 0) return;
+
+    const audio_io_handle_t dapIo = snapshot.callback->io();
+    if (dapIo == AUDIO_IO_HANDLE_NONE) {
+        return;
+    }
+
+    if (!effect->isOffloadable() || !effect->isOffloaded_l()) {
+        // Offload capability is not the active route: REMOTE_SUBMIX may have
+        // requested software processing from an otherwise offloadable DAP.
+        if (threadType != IAfThreadBase::MIXER
+                || dapIo != io) {
+            return;
+        }
+    } else if (dapIo != io
+            && (flags & AUDIO_OUTPUT_FLAG_DEEP_BUFFER) == 0) {
+        return;
+    }
+
+    const bool scalarPregain = usesQdspControlPath();
+    // Preserve the reference flag precedence, but choose the output class
+    // independently of the cache hit. DIRECT|COMPRESS_OFFLOAD must not change
+    // parameter class merely because its DIRECT pregain is already current.
+    audio_output_flags_t pregainFlag = AUDIO_OUTPUT_FLAG_NONE;
+    if ((flags & AUDIO_OUTPUT_FLAG_DEEP_BUFFER) != 0) {
+        pregainFlag = AUDIO_OUTPUT_FLAG_DEEP_BUFFER;
+    } else if ((flags & AUDIO_OUTPUT_FLAG_DIRECT) != 0) {
+        pregainFlag = AUDIO_OUTPUT_FLAG_DIRECT;
+    } else if ((flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) != 0) {
+        pregainFlag = AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD;
+    }
+
+    uint32_t combinedVolume = 0;
+    uint64_t generation;
+    {
+        std::lock_guard lock(mMutex);
+        if (mEffect != effect || mEffectIo != dapIo
+                || mSyncedCallback != snapshot.callback) {
+            // Wait for the attachment's updateOffload transaction.
+            return;
+        }
+        if (maxVolume != 0) {
+            mOutputVolumes[io] = maxVolume;
+        }
+        for (const auto& entry : mOutputVolumes) {
+            combinedVolume = std::max(combinedVolume, entry.second);
+        }
+        // Stock does not send zero pregain when every output is silent.
+        if (combinedVolume == 0 || (!scalarPregain && pregainFlag == AUDIO_OUTPUT_FLAG_NONE)) {
+            return;
+        }
+        const uint32_t lastPregain = scalarPregain ? mLastScalarPregain
+                : pregainFlag == AUDIO_OUTPUT_FLAG_DEEP_BUFFER ? mLastDeepBufferPregain
+                : pregainFlag == AUDIO_OUTPUT_FLAG_DIRECT
+                        ? mLastDirectPregain : mLastOffloadPregain;
+        if (combinedVolume == lastPregain) {
+            return;
+        }
+        generation = mGeneration;
+    }
+
+    // Alioth's preserved DapEffectContext::setPregain reads one U8.24 value.
+    // The newer Xiaomi reference's second output-flag word is a separate ABI.
+    const status_t status = scalarPregain
+            ? setParam(effect, kParamSetPregain, static_cast<int32_t>(combinedVolume))
+            : setParameters(effect, kParamSetPregain,
+                    {static_cast<int32_t>(combinedVolume), static_cast<int32_t>(pregainFlag)});
+    if (status != NO_ERROR) {
+        return;
+    }
+
+    std::lock_guard lock(mMutex);
+    if (mEffect != effect) return;
+    if (mGeneration != generation) {
+        // A zero-volume retirement can run before it waits for our chain lock.
+        // The command just reached the HAL with a now-obsolete maximum. An
+        // earlier cached ACK is no longer authoritative either: force replay.
+        mLastScalarPregain = 0;
+        mLastDeepBufferPregain = 0;
+        mLastDirectPregain = 0;
+        mLastOffloadPregain = 0;
+        return;
+    }
+    if (scalarPregain) {
+        // The QDSP parameter is global: an ACK from another output class
+        // supersedes the previous value too. Never use three class-local ACKs.
+        mLastScalarPregain = combinedVolume;
+    } else if (pregainFlag == AUDIO_OUTPUT_FLAG_DEEP_BUFFER) {
+        mLastDeepBufferPregain = combinedVolume;
+    } else if (pregainFlag == AUDIO_OUTPUT_FLAG_DIRECT) {
+        mLastDirectPregain = combinedVolume;
+    } else if (pregainFlag == AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) {
+        mLastOffloadPregain = combinedVolume;
+    }
+}
+
+uint32_t DolbyDapController::volumeToU8_24(float volume) {
+    if (!std::isfinite(volume) || volume <= 0.f) return 0;
+    constexpr double maxValue = std::numeric_limits<uint32_t>::max();
+    const double scaled = static_cast<double>(volume) * (1u << 24);
+    return scaled >= maxValue ? std::numeric_limits<uint32_t>::max()
+                              : static_cast<uint32_t>(scaled);
 }
 
 status_t DolbyDapController::skipHardBypass() {

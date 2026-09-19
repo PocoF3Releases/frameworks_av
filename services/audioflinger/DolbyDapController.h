@@ -50,12 +50,23 @@ public:
     // A failed/released patch has no confirmed route. Do not retain its I/O ACK.
     void invalidateOutput(audio_io_handle_t io) EXCLUDES_EffectChain_Mutex;
 
+    void updatePregain(
+            IAfThreadBase::type_t threadType,
+            audio_io_handle_t io,
+            audio_output_flags_t flags,
+            uint32_t maxVolume) EXCLUDES_EffectChain_Mutex;
+
+    // Saturating U8.24 conversion. Invalid channels contribute silence rather
+    // than causing undefined float-to-integer conversion in the control path.
+    static uint32_t volumeToU8_24(float volume);
+
     status_t skipHardBypass() EXCLUDES_EffectChain_Mutex;
 
 private:
     DolbyDapController() = default;
 
     bool usesQdspControlPath() const;
+    bool usesLegacyDax36ControlPath() const;
     struct EffectSnapshot {
         sp<IAfEffectModule> effect;
         sp<EffectCallbackInterface> callback;
@@ -67,6 +78,8 @@ private:
             REQUIRES(audio_utils::EffectChain_Mutex);
     bool syncAttachment_l(const EffectSnapshot& snapshot)
             REQUIRES(audio_utils::EffectChain_Mutex) EXCLUDES_EffectBase_Mutex;
+    bool observeEnabled_l(const EffectSnapshot& snapshot)
+            REQUIRES(audio_utils::EffectChain_Mutex);
     // Bookkeeping only; caller holds mMutex, never an effect command.
     void resetAttachmentState_l(audio_io_handle_t io);
 
@@ -93,7 +106,13 @@ private:
     unsigned mAttachmentFailures = 0;
     int64_t mNextAttachmentAttemptNs = 0;
     audio_io_handle_t mEffectIo = AUDIO_IO_HANDLE_NONE;
+    uint64_t mGeneration = 0;
+    std::map<audio_io_handle_t, uint32_t> mOutputVolumes;
 
+    uint32_t mLastScalarPregain = 0;
+    uint32_t mLastDeepBufferPregain = 0;
+    uint32_t mLastDirectPregain = 0;
+    uint32_t mLastOffloadPregain = 0;
 };
 
 }  // namespace android
