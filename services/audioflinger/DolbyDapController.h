@@ -56,6 +56,27 @@ public:
             audio_output_flags_t flags,
             uint32_t maxVolume) EXCLUDES_EffectChain_Mutex;
 
+    struct ActiveTrackState {
+        uint32_t flags = 0;
+        bool hasTracks = false;
+    };
+
+    // Caller owns the output thread lock. No live track objects cross into the
+    // controller, which may need to lock a DIFFERENT output's effect chain.
+    template <typename Tracks>
+    static ActiveTrackState summarizeTracks(const Tracks& tracks) {
+        ActiveTrackState state;
+        for (const auto& track : tracks) {
+            if (track != nullptr && !track->isFastTrack() && track->isExternalTrack()) {
+                state.flags |= static_cast<uint32_t>(track->attributes().flags);
+                state.hasTracks = true;
+            }
+        }
+        return state;
+    }
+    void updateAudioTracks(audio_io_handle_t io, ActiveTrackState state)
+            EXCLUDES_EffectChain_Mutex;
+
     // Saturating U8.24 conversion. Invalid channels contribute silence rather
     // than causing undefined float-to-integer conversion in the control path.
     static uint32_t volumeToU8_24(float volume);
@@ -108,6 +129,13 @@ private:
     audio_io_handle_t mEffectIo = AUDIO_IO_HANDLE_NONE;
     uint64_t mGeneration = 0;
     std::map<audio_io_handle_t, uint32_t> mOutputVolumes;
+
+    std::map<audio_io_handle_t, uint32_t> mOutputAudioFlags;
+    std::optional<uint32_t> mDesiredAudioFlags;
+    std::optional<uint32_t> mLastAudioFlags;
+    uint64_t mAudioFlagsGeneration = 0;
+    unsigned mAudioFlagsFailures = 0;
+    int64_t mNextAudioFlagsAttemptNs = 0;
 
     uint32_t mLastScalarPregain = 0;
     uint32_t mLastDeepBufferPregain = 0;

@@ -28,6 +28,7 @@ constexpr effect_uuid_t kDapTypeUuid = {
 constexpr int32_t kParamSetPregain = 0x10;
 constexpr int32_t kParamSkipHardBypass = 0x13;
 constexpr int32_t kParamIoHandle = 0x14;
+constexpr int32_t kParamSetAudioFlag = 0x15;
 
 constexpr char kDolbySupportProperty[] = "ro.vendor.audio.dolby.dax.support";
 // This is the effect-binary contract selected by the product, not the audio HAL
@@ -115,6 +116,12 @@ void DolbyDapController::resetAttachmentState_l(audio_io_handle_t io) {
     mAttachmentFailures = 0;
     mNextAttachmentAttemptNs = 0;
     mOutputVolumes.clear();
+    mOutputAudioFlags.clear();
+    mDesiredAudioFlags.reset();
+    mLastAudioFlags.reset();
+    mAudioFlagsFailures = 0;
+    mNextAudioFlagsAttemptNs = 0;
+    ++mAudioFlagsGeneration;
     mLastScalarPregain = 0;
     mLastDeepBufferPregain = 0;
     mLastDirectPregain = 0;
@@ -201,6 +208,7 @@ void DolbyDapController::invalidateOutput(audio_io_handle_t io) {
             mLastOffloadPregain = 0;
             ++mGeneration;
         }
+        if (mOutputAudioFlags.erase(io) != 0) ++mAudioFlagsGeneration;
     }
     const auto snapshot = currentEffect();
     if (snapshot.chain == nullptr) return;
@@ -265,6 +273,12 @@ bool DolbyDapController::observeEnabled_l(const EffectSnapshot& snapshot) {
         if (mEffect != effect) return false;
         if (!enabled) {
             mOutputVolumes.clear();
+            mOutputAudioFlags.clear();
+            mDesiredAudioFlags.reset();
+            mLastAudioFlags.reset();
+            mAudioFlagsFailures = 0;
+            mNextAudioFlagsAttemptNs = 0;
+            ++mAudioFlagsGeneration;
             mLastScalarPregain = 0;
             mLastDeepBufferPregain = 0;
             mLastDirectPregain = 0;
@@ -423,6 +437,72 @@ uint32_t DolbyDapController::volumeToU8_24(float volume) {
     const double scaled = static_cast<double>(volume) * (1u << 24);
     return scaled >= maxValue ? std::numeric_limits<uint32_t>::max()
                               : static_cast<uint32_t>(scaled);
+}
+
+void DolbyDapController::updateAudioTracks(audio_io_handle_t io, ActiveTrackState state) {
+    if (!isSupported() || io == AUDIO_IO_HANDLE_NONE) return;
+    if (!state.hasTracks) {
+        // Retirement must work even after the effect moves or becomes software.
+        std::lock_guard lock(mMutex);
+        if (mOutputAudioFlags.erase(io) != 0) ++mAudioFlagsGeneration;
+    }
+    const auto snapshot = currentEffect();
+    if (snapshot.chain == nullptr) return;
+    audio_utils::lock_guard chainLock(snapshot.chain->mutex());
+    if (!isCurrentEffect_l(snapshot)) return;
+    const bool enabled = observeEnabled_l(snapshot);
+    if (!syncAttachment_l(snapshot) || !enabled) return;
+    // Retain playback-driven attachment recovery, but do not send unsupported
+    // private metadata to QDSP DAP. This is not DMS track-lifecycle reporting.
+    if (usesQdspControlPath()) return;
+
+    // The reference accepts external tracks across DSP outputs. For software
+    // DAP only the owning output is relevant. Never borrow a foreign thread lock.
+    if ((!snapshot.effect->isOffloadable() || !snapshot.effect->isOffloaded_l())
+            && snapshot.callback->io() != io) return;
+
+    uint32_t flags = 0;
+    uint64_t generation;
+    {
+        std::lock_guard lock(mMutex);
+        if (mEffect != snapshot.effect) return;
+        if (state.hasTracks) mOutputAudioFlags[io] = state.flags;
+        for (const auto& entry : mOutputAudioFlags) flags |= entry.second;
+        if (mDesiredAudioFlags != flags) {
+            mDesiredAudioFlags = flags;
+            mAudioFlagsFailures = 0;
+            mNextAudioFlagsAttemptNs = 0;
+            ++mAudioFlagsGeneration;
+        }
+        if (mLastAudioFlags == flags || mAudioFlagsFailures > kAttachmentRetryNs.size()
+                || systemTime(SYSTEM_TIME_MONOTONIC) < mNextAudioFlagsAttemptNs) return;
+        generation = mAudioFlagsGeneration;
+    }
+    // Attribute flags, NOT output flags or DMS FOURCC parameters. Clearing the
+    // final contributor writes zero once, preventing stale flags after teardown.
+    const status_t status = setParam(snapshot.effect, kParamSetAudioFlag,
+            static_cast<int32_t>(flags));
+    std::lock_guard lock(mMutex);
+    if (mEffect != snapshot.effect) return;
+    if (mAudioFlagsGeneration != generation) {
+        mLastAudioFlags.reset();
+        return;
+    }
+    if (status == NO_ERROR) {
+        mLastAudioFlags = flags;
+        mAudioFlagsFailures = 0;
+        mNextAudioFlagsAttemptNs = 0;
+    } else {
+        // A rejected optional metadata command must not disable DAP or block
+        // pregain. Retry a bounded burst, renewed only by actual state changes.
+        ++mAudioFlagsFailures;
+        if (mAudioFlagsFailures <= kAttachmentRetryNs.size()) {
+            mNextAudioFlagsAttemptNs = systemTime(SYSTEM_TIME_MONOTONIC)
+                    + kAttachmentRetryNs[mAudioFlagsFailures - 1];
+        }
+        ALOGW("%s: DAP flags %#x failed %d, attempt %u", __func__, flags, status,
+                mAudioFlagsFailures);
+    }
 }
 
 status_t DolbyDapController::skipHardBypass() {

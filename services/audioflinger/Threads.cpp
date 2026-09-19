@@ -3827,6 +3827,7 @@ void PlaybackThread::threadLoop_exit()
         mActiveTracks.clear();
     }
 
+    DolbyDapController::getInstance().updateAudioTracks(mId, {});
     if (mOutput != nullptr) {
         DolbyDapController::getInstance().updatePregain(
                 mType, mId, mOutput->flags, 0);
@@ -4281,6 +4282,7 @@ NO_THREAD_SAFETY_ANALYSIS  // manual locking of AudioFlinger
                 if (mActiveTracks.empty() && mConfigEvents.empty()) {
                     // This path can sleep before prepareTracks_l() runs again.
                     // Retire the output's Dolby state before that indefinite wait.
+                    DolbyDapController::getInstance().updateAudioTracks(mId, {});
                     if (mOutput != nullptr) {
                         DolbyDapController::getInstance().updatePregain(
                                 mType, mId, mOutput->flags, 0);
@@ -4319,6 +4321,13 @@ NO_THREAD_SAFETY_ANALYSIS  // manual locking of AudioFlinger
             mMixerStatus = prepareTracks_l(&tracksToRemove);
 
             mActiveTracks.updatePowerState_l(this);
+            // Snapshot under this output's lock, before acquiring effect chains.
+            if (DolbyDapController::isSupported()) {
+                DolbyDapController::getInstance().updateAudioTracks(mId,
+                        isSuspended() || !mDolbyRouteReady
+                                ? DolbyDapController::ActiveTrackState{}
+                                : DolbyDapController::summarizeTracks(mActiveTracks));
+            }
             if (mMixerStatus == MIXER_IDLE && mActiveTracks.empty()
                     && mOutput != nullptr) {
                 DolbyDapController::getInstance().updatePregain(
