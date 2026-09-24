@@ -119,6 +119,10 @@ public:
     // Initializes the Effects (AudioSystem must be ready as this creates audio client objects).
     void initDefaultDeviceEffects() EXCLUDES(mDeviceEffectsMutex) EXCLUDES_EffectHandle_Mutex;
 
+    // Alioth/MIUI keeps one low-priority global DAP handle alive for the lifetime
+    // of AudioPolicyService. Higher-priority control apps can still own the engine.
+    void initGlobalDolbyEffect() EXCLUDES_AudioPolicyEffects_Mutex EXCLUDES_EffectHandle_Mutex;
+
 private:
 
     // class to store the description of an effects and its parameters
@@ -264,6 +268,9 @@ private:
     // Automatic output effects are unique for an audio_session_t.
     std::map<audio_session_t, std::shared_ptr<EffectVector>> mOutputSessions
             GUARDED_BY(mMutex);
+
+    // Persistent low-priority owner for the global output-mix DAP engine.
+    sp<AudioEffect> mGlobalDolbyEffect GUARDED_BY(mMutex);
 
     /**
      * @brief mDeviceEffects map of device effects indexed by the device address

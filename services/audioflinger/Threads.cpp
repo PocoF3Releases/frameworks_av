@@ -23,6 +23,7 @@
 #include "Threads.h"
 
 #include "Client.h"
+#include "DolbyDapController.h"
 #include "IAfEffect.h"
 #include "MelReporter.h"
 #include "ResamplerBufferProvider.h"
@@ -1736,6 +1737,10 @@ sp<IAfEffectHandle> ThreadBase::createEffect_l(
         if (lStatus == OK) {
             lStatus = effect->addHandle(handle.get());
             sendCheckOutputStageEffectsEvent_l();
+            if (lStatus == OK && effectCreated) {
+                DolbyDapController::getInstance().effectCreated(
+                        effect, mId, mType, outDeviceTypes_l());
+            }
         }
         if (enabled != NULL) {
             *enabled = (int)effect->isEnabled();
@@ -1875,6 +1880,9 @@ status_t ThreadBase::addEffect_ll(const sp<IAfEffectModule>& effect)
     effect->setInputDevice(inDeviceTypeAddr());
     effect->setMode(mAfThreadCallback->getMode());
     effect->setAudioSource(mAudioSource);
+
+    DolbyDapController::getInstance().updateOffload(
+            mId, mType, outDeviceTypes_l());
 
     return NO_ERROR;
 }
@@ -3716,6 +3724,12 @@ void PlaybackThread::threadLoop_exit()
         // TODO: should we decActiveTrackCnt() of the cleared track effect chain?
         mActiveTracks.clear();
     }
+
+    DolbyDapController::getInstance().updateAudioTracks(mId, {});
+    if (mOutput != nullptr) {
+        DolbyDapController::getInstance().updatePregain(
+                mType, mId, mOutput->flags, 0);
+    }
 }
 
 /*
@@ -4167,6 +4181,13 @@ NO_THREAD_SAFETY_ANALYSIS  // manual locking of AudioFlinger
                 }
 
                 if (mActiveTracks.empty() && mConfigEvents.empty()) {
+                    // This path can sleep before prepareTracks_l() runs again.
+                    // Retire the output's Dolby state before that indefinite wait.
+                    DolbyDapController::getInstance().updateAudioTracks(mId, {});
+                    if (mOutput != nullptr) {
+                        DolbyDapController::getInstance().updatePregain(
+                                mType, mId, mOutput->flags, 0);
+                    }
                     // we're about to wait, flush the binder command buffer
                     IPCThreadState::self()->flushCommands();
 
@@ -4201,6 +4222,18 @@ NO_THREAD_SAFETY_ANALYSIS  // manual locking of AudioFlinger
             mMixerStatus = prepareTracks_l(&tracksToRemove);
 
             mActiveTracks.updatePowerState_l(this);
+            // Snapshot under this output's lock, before acquiring effect chains.
+            if (DolbyDapController::isSupported()) {
+                DolbyDapController::getInstance().updateAudioTracks(mId,
+                        isSuspended() || !mDolbyRouteReady
+                                ? DolbyDapController::ActiveTrackState{}
+                                : DolbyDapController::summarizeTracks(mActiveTracks));
+            }
+            if (mMixerStatus == MIXER_IDLE && mActiveTracks.empty()
+                    && mOutput != nullptr) {
+                DolbyDapController::getInstance().updatePregain(
+                        mType, mId, mOutput->flags, 0);
+            }
 
             metadataUpdate = updateMetadata_l();
 
@@ -4999,6 +5032,16 @@ status_t PlaybackThread::createAudioPatch_l(const struct audio_patch *patch,
         status = mOutput->stream->legacyCreateAudioPatch(patch->sinks[0], std::nullopt, type);
         *handle = AUDIO_PATCH_HANDLE_NONE;
     }
+
+    mDolbyRouteReady = status == NO_ERROR;
+    if (mDolbyRouteReady) {
+        // A device switch can reuse this I/O and effect chain. Re-synchronize
+        // DSP/software routing only after the HAL accepted the new patch.
+        DolbyDapController::getInstance().updateOffload(mId, mType, outDeviceTypes_l());
+    } else {
+        DolbyDapController::getInstance().invalidateOutput(mId);
+    }
+
     const std::string patchSinksAsString = patchSinksToString(patch);
 
     mThreadMetrics.logEndInterval();
@@ -5037,6 +5080,8 @@ status_t PlaybackThread::releaseAudioPatch_l(const audio_patch_handle_t handle)
 {
     status_t status = NO_ERROR;
 
+    mDolbyRouteReady = false;
+    DolbyDapController::getInstance().invalidateOutput(mId);
     mPatch = audio_patch{};
     mOutDeviceTypeAddrs.clear();
 
@@ -5578,6 +5623,7 @@ PlaybackThread::mixer_state MixerThread::prepareTracks_l(
     size_t tracksWithEffect = 0;
     // counts only _active_ fast tracks
     size_t fastTracks = 0;
+    uint32_t dolbyMaxVolume = 0;
     std::vector<sp<IAfTrack>> resetTracks;
 
     float masterVolume = mMasterVolume;
@@ -6101,6 +6147,12 @@ PlaybackThread::mixer_state MixerThread::prepareTracks_l(
 
             track->setFinalVolume(vlf, vrf);
 
+            if (DolbyDapController::isSupported() && track->isExternalTrack()) {
+                dolbyMaxVolume = std::max(dolbyMaxVolume,
+                        std::max(DolbyDapController::volumeToU8_24(vlf),
+                                 DolbyDapController::volumeToU8_24(vrf)));
+            }
+
             // Delegate volume control to effect in track effect chain if needed
             if (chain != 0 && chain->setVolume(&vl, &vr)) {
                 // Do not ramp volume if volume is controlled by effect
@@ -6422,6 +6474,15 @@ PlaybackThread::mixer_state MixerThread::prepareTracks_l(
 
     // if any fast tracks, then status is ready
     mMixerStatusIgnoringFastTracks = mixerStatus;
+
+    if (mOutput != nullptr) {
+        // FAST-only/internal-only playback must also retire the previous normal
+        // mixer contribution; waiting for mActiveTracks.empty() is insufficient.
+        DolbyDapController::getInstance().updatePregain(mType, mId, mOutput->flags,
+                mMixerStatusIgnoringFastTracks == MIXER_TRACKS_READY
+                        && !isSuspended() && mDolbyRouteReady ? dolbyMaxVolume : 0);
+    }
+
     if (fastTracks > 0) {
         mixerStatus = MIXER_TRACKS_READY;
     }
@@ -6849,26 +6910,56 @@ void DirectOutputThread::processVolume_l(const sp<IAfTrack>& track, bool lastTra
 
         track->maybeLogPlaybackHardening(*amn);
     }
+    if (!DolbyDapController::isSupported()) {
+        if (lastTrack) {
+            track->setFinalVolume(left, right);
+            if (left != mLeftVolFloat || right != mRightVolFloat) {
+                mLeftVolFloat = left;
+                mRightVolFloat = right;
+
+                // Delegate volume control to effect in track effect chain if needed
+                // only one effect chain can be present on DirectOutputThread, so if
+                // there is one, the track is connected to it
+                if (!mEffectChains.empty()) {
+                    // if effect chain exists, volume is handled by it.
+                    // Convert volumes from float to 8.24
+                    uint32_t vl = (uint32_t)(left * (1 << 24));
+                    uint32_t vr = (uint32_t)(right * (1 << 24));
+                    // Direct/Offload effect chains set output volume in setVolume().
+                    (void)mEffectChains[0]->setVolume(&vl, &vr);
+                } else {
+                    // otherwise we directly set the volume.
+                    setVolumeForOutput_l(left, right);
+                }
+            }
+        }
+        return;
+    }
     if (lastTrack) {
         track->setFinalVolume(left, right);
-        if (left != mLeftVolFloat || right != mRightVolFloat) {
-            mLeftVolFloat = left;
-            mRightVolFloat = right;
-
-            // Delegate volume control to effect in track effect chain if needed
-            // only one effect chain can be present on DirectOutputThread, so if
-            // there is one, the track is connected to it
-            if (!mEffectChains.empty()) {
-                // if effect chain exists, volume is handled by it.
-                // Convert volumes from float to 8.24
-                uint32_t vl = (uint32_t)(left * (1 << 24));
-                uint32_t vr = (uint32_t)(right * (1 << 24));
-                // Direct/Offload effect chains set output volume in setVolume().
-                (void)mEffectChains[0]->setVolume(&vl, &vr);
-            } else {
-                // otherwise we directly set the volume.
-                setVolumeForOutput_l(left, right);
+        const bool volumeChanged = left != mLeftVolFloat || right != mRightVolFloat;
+        mLeftVolFloat = left;
+        mRightVolFloat = right;
+        uint32_t dolbyVolume = 0;
+        if (!mEffectChains.empty()
+                && (volumeChanged || DolbyDapController::isSupported())) {
+            uint32_t vl = DolbyDapController::volumeToU8_24(left);
+            uint32_t vr = DolbyDapController::volumeToU8_24(right);
+            // EffectChain already caches unchanged volumes. Revisit it even at
+            // the same user volume so route/gate recovery can reapply the gain.
+            (void)mEffectChains[0]->setVolume(&vl, &vr);
+            if (track->isExternalTrack() && !track->isFastTrack()
+                    && !isSuspended() && mDolbyRouteReady) {
+                dolbyVolume = std::max(vl, vr);
             }
+        } else if (mEffectChains.empty() && volumeChanged) {
+            setVolumeForOutput_l(left, right);
+        }
+        if (mOutput != nullptr) {
+            // Retry attachment and failed gain ACKs without waiting for the user
+            // to change volume. No chain means no direct-DAP contribution.
+            DolbyDapController::getInstance().updatePregain(
+                    mType, mId, mOutput->flags, dolbyVolume);
         }
     }
 }
