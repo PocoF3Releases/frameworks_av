@@ -22,6 +22,7 @@
 #include <string.h>
 #include <memory>
 #include <cutils/misc.h>
+#include <cutils/properties.h>
 #include <media/AudioEffect.h>
 #include <media/EffectsConfig.h>
 #include <system/audio.h>
@@ -36,6 +37,56 @@
 namespace android {
 
 using content::AttributionSourceState;
+
+#ifdef ENABLE_LEGACY_DAP_INTEGRATION
+namespace {
+
+constexpr char kDolbyDaxSupportProperty[] = "ro.vendor.audio.dolby.dax.support";
+
+constexpr effect_uuid_t kDolbyDapUuid = {
+        0x9d4921da, 0x8225, 0x4f29, 0xaefa,
+        {0x39, 0x53, 0x7a, 0x04, 0xbc, 0xaa}};
+
+constexpr int32_t kDolbyCpdpValues = 5;
+constexpr size_t kDolbyScalarResponseInts = 3;
+
+int getDolbyNativeEnabled(const sp<AudioEffect>& effect) {
+    const int32_t paramId = kDolbyCpdpValues;
+    constexpr size_t parameterSize = sizeof(paramId);
+    constexpr size_t parameterOffset =
+            ((parameterSize - 1) / sizeof(int32_t) + 1) * sizeof(int32_t);
+    constexpr size_t valueSize = kDolbyScalarResponseInts * sizeof(int32_t);
+
+    std::vector<uint8_t> buffer(
+            sizeof(effect_param_t) + parameterOffset + valueSize, 0);
+    auto* parameter = reinterpret_cast<effect_param_t*>(buffer.data());
+    parameter->psize = parameterSize;
+    parameter->vsize = valueSize;
+    memcpy(parameter->data, &paramId, parameterSize);
+
+    status_t status = effect->getParameter(parameter);
+    if (status != NO_ERROR) {
+        ALOGW("%s: DAP enable read failed: %d", __func__, status);
+        return -1;
+    }
+    if (parameter->status != NO_ERROR || parameter->psize != parameterSize
+            || parameter->vsize < sizeof(int32_t) || parameter->vsize > valueSize
+            || parameter->vsize % sizeof(int32_t) != 0
+            || memcmp(parameter->data, &paramId, parameterSize) != 0) {
+        ALOGW("%s: invalid DAP enable response status=%d size=%u",
+                __func__, parameter->status, parameter->vsize);
+        return -1;
+    }
+
+    int32_t value = 0;
+    memcpy(&value, parameter->data + parameterOffset, sizeof(value));
+    // XiaomiDolby uses integer 1 for enabled, not an arbitrary positive value.
+    // A malformed/unknown native state must not turn the framework gate on.
+    return value == 0 || value == 1 ? value : -1;
+}
+
+}  // namespace
+#endif
 
 // ----------------------------------------------------------------------------
 // AudioPolicyEffects Implementation
@@ -59,6 +110,78 @@ AudioPolicyEffects::AudioPolicyEffects(const sp<EffectsFactoryHalInterface>& eff
     } else if (loadResult > 0) {
         ALOGE("Effect config is partially invalid, skipped %d elements", loadResult);
     }
+}
+
+void AudioPolicyEffects::initGlobalDolbyEffect() {
+#ifdef ENABLE_LEGACY_DAP_INTEGRATION
+    if (!property_get_bool(kDolbyDaxSupportProperty, false)) return;
+    // Only the explicitly selected Qualcomm DAX 3.6 contract has a tested
+    // CPDP enable query and low-priority global-owner lifecycle here.
+    char control[PROPERTY_VALUE_MAX] = {};
+    char version[PROPERTY_VALUE_MAX] = {};
+    property_get("ro.vendor.audio.dolby.dap.control", control, "none");
+    property_get("ro.vendor.audio.dolby.dax.version", version, "");
+    constexpr char prefix[] = "DAX3_3.6";
+    constexpr size_t length = sizeof(prefix) - 1;
+    if (strcmp(control, "qdsp") != 0
+            || strncmp(version, prefix, length) != 0
+            || (version[length] != '\0' && version[length] != '.' && version[length] != '_')) {
+        return;
+    }
+
+    {
+        audio_utils::lock_guard _l(mMutex);
+        if (mGlobalDolbyEffect != nullptr) {
+            return;
+        }
+    }
+
+    const int64_t token = IPCThreadState::self()->clearCallingIdentity();
+    AttributionSourceState attributionSource;
+    attributionSource.packageName = "android";
+    attributionSource.token = sp<BBinder>::make();
+
+    auto effect = sp<AudioEffect>::make(attributionSource);
+    const status_t setStatus = effect->set(
+            nullptr /* type */,
+            &kDolbyDapUuid,
+            0 /* priority */,
+            nullptr /* callback */,
+            AUDIO_SESSION_OUTPUT_MIX,
+            AUDIO_IO_HANDLE_NONE);
+    IPCThreadState::self()->restoreCallingIdentity(token);
+
+    if (setStatus != NO_ERROR && setStatus != ALREADY_EXISTS) {
+        ALOGW("%s: failed to create global DAP: %d", __func__, setStatus);
+        return;
+    }
+
+    const status_t initStatus = effect->initCheck();
+    if (initStatus != NO_ERROR && initStatus != ALREADY_EXISTS) {
+        ALOGW("%s: global DAP init failed: %d", __func__, initStatus);
+        return;
+    }
+
+    // Bootstrap only while this low-priority handle has control. If XiaomiDolby
+    // already owns the effect, retain it without reading and replaying a stale
+    // gate value. AudioFlinger still arbitrates a handoff during the command.
+    const int nativeEnabled = initStatus == NO_ERROR ? getDolbyNativeEnabled(effect) : -1;
+    if (nativeEnabled >= 0 && effect->initCheck() == NO_ERROR) {
+        const status_t enableStatus = effect->setEnabled(nativeEnabled != 0);
+        if (enableStatus != NO_ERROR && enableStatus != INVALID_OPERATION) {
+            ALOGW("%s: failed to mirror DAP enable=%d: %d",
+                    __func__, nativeEnabled, enableStatus);
+        }
+    }
+
+    {
+        audio_utils::lock_guard _l(mMutex);
+        if (mGlobalDolbyEffect == nullptr) {
+            mGlobalDolbyEffect = std::move(effect);
+            ALOGI("%s: retained global Dolby DAP owner", __func__);
+        }
+    }
+#endif
 }
 
 status_t AudioPolicyEffects::addInputEffects(audio_io_handle_t input,
