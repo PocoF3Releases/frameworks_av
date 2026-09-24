@@ -190,6 +190,7 @@ cc_library {
     name: "libaudioflinger",
 
     defaults: [
+        "legacy_dap_integration_defaults",
         "audioflinger_flags_defaults",
         "latest_android_hardware_audio_core_sounddose_ndk_export_shared_lib_header",
         "latest_android_hardware_audio_core_sounddose_ndk_shared",
@@ -201,6 +202,7 @@ cc_library {
         "AudioFlinger.cpp",
         "Client.cpp",
         "DeviceEffectManager.cpp",
+        "DolbyDapController.cpp",
         "Effects.cpp",
         "MelReporter.cpp",
         "PatchCommandThread.cpp",
@@ -262,4 +264,14 @@ cc_library {
 cc_library_headers {
     name: "libaudioflinger_headers",
     export_include_dirs: ["."],
+}
+
+// Independent product consent for the private legacy DAP effect ABI.
+cc_defaults {
+    name: "legacy_dap_integration_defaults",
+    cflags: select(soong_config_variable("audio", "legacy_dap_integration"), {
+        true: ["-DENABLE_LEGACY_DAP_INTEGRATION"],
+        false: [],
+        default: [],
+    }),
 }

@@ -343,6 +343,11 @@ public:
 
     virtual bool isFirstEffect_l(int id) const REQUIRES(audio_utils::EffectChain_Mutex) = 0;
 
+    // Prove membership while retaining the chain lock across an external command.
+    // Implementations without this query conservatively reject such commands.
+    virtual bool containsEffect_l(const sp<IAfEffectModule>&) const
+            REQUIRES(audio_utils::EffectChain_Mutex) { return false; }
+
     virtual size_t numberOfEffects() const = 0;
     virtual sp<IAfEffectModule> getEffectModule(size_t index) const = 0;
 
