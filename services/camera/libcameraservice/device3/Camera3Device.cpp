@@ -156,6 +156,17 @@ Camera3Device::~Camera3Device()
     disconnectImpl();
 }
 
+void Camera3Device::setSessionClientPackageName(const std::string& packageName) {
+    Mutex::Autolock interfaceLock(mInterfaceLock);
+    Mutex::Autolock stateLock(mLock);
+    // The binding is immutable once the device can accept configurations.
+    if (mStatus != STATUS_UNINITIALIZED) {
+        ALOGW("%s: client identity must be set before initialization", __FUNCTION__);
+        return;
+    }
+    mSessionClientPackageName = packageName;
+}
+
 const std::string& Camera3Device::getId() const {
     return mId;
 }
@@ -2570,8 +2581,9 @@ bool Camera3Device::reconfigureCamera(const CameraMetadata& sessionParams, int c
 
 
 status_t Camera3Device::configureStreamsLocked(int operatingMode,
-        const CameraMetadata& sessionParams, bool notifyRequestThread) {
+        const CameraMetadata& originalSessionParams, bool notifyRequestThread) {
     ATRACE_CALL();
+    CameraMetadata sessionParams(originalSessionParams);
     status_t res;
     // Stream/surface setup can include a lot of binder IPC. Raise the
     // thread priority when running the binder IPC heavy configuration
@@ -2591,19 +2603,43 @@ status_t Camera3Device::configureStreamsLocked(int operatingMode,
 #ifdef CAMERA_PACKAGE_NAME
     sp<VendorTagDescriptor> vTags;
     sp<VendorTagDescriptorCache> vCache = VendorTagDescriptorCache::getGlobalVendorTagCache();
-    if (vCache.get()) {
-        const camera_metadata_t *metaBuffer = sessionParams.getAndLock();
-        metadata_vendor_id_t vendorId = get_camera_metadata_vendor_id(metaBuffer);
-        sessionParams.unlock(metaBuffer);
-        vCache->getVendorTagDescriptor(vendorId, &vTags);
+    // Empty session parameters need not have a vendor ID. Use the provider
+    // associated with this camera, rather than looking up an invalid cache key.
+    if (vCache.get() &&
+            vCache->getVendorTagDescriptor(mVendorTagId, &vTags) == OK && vTags.get()) {
         uint32_t tag;
-        if (CameraMetadata::getTagFromName(CAMERA_PACKAGE_NAME, vTags.get(), &tag)) {
-            ALOGE("%s: Unable to get %s tag", __FUNCTION__, CAMERA_PACKAGE_NAME);
-        } else {
-            std::string pkgName = CameraService::getCurrPackageName();
-            status_t res = const_cast<CameraMetadata&>(sessionParams).update(tag, String8(pkgName.c_str()));
-            if (res) {
-                ALOGE("%s: metadata update failed, res = %d", __FUNCTION__, res);
+        // Retain devices which configure a full tag name. Xiaomi's client-name
+        // tag is not the application's package name (e.g. com.android.camera).
+        status_t tagStatus = CameraMetadata::getTagFromName(
+                CAMERA_PACKAGE_NAME, vTags.get(), &tag);
+#ifdef XIAOMI_SESSION_CLIENT_NAME
+        // Preserve the product's package setting. This provider-specific fallback
+        // is an independent opt-in, not a reinterpretation of that setting.
+        if (tagStatus != OK) {
+            tagStatus = CameraMetadata::getTagFromName(
+                    "com.xiaomi.sessionparams.clientName", vTags.get(), &tag);
+        }
+#endif
+        if (tagStatus == OK && vTags->getTagType(tag) == TYPE_BYTE) {
+            const std::string& pkgName = mSessionClientPackageName;
+            if (!pkgName.empty()) {
+                // Own the buffer before setting its vendor ID. Never mutate
+                // the caller's const metadata through a const_cast.
+                camera_metadata_t *buffer = sessionParams.release();
+                if (buffer == nullptr) {
+                    buffer = allocate_camera_metadata(1, pkgName.size() + 1);
+                }
+                if (buffer != nullptr) {
+                    set_camera_metadata_vendor_id(buffer, mVendorTagId);
+                    sessionParams.acquire(buffer);
+                    status_t updateStatus = sessionParams.update(tag, String8(pkgName.c_str()));
+                    if (updateStatus != OK) {
+                        ALOGE("%s: client-name metadata update failed: %d",
+                                __FUNCTION__, updateStatus);
+                    }
+                } else {
+                    ALOGE("%s: unable to allocate client-name metadata", __FUNCTION__);
+                }
             }
         }
     }

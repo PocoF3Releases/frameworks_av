@@ -101,6 +101,10 @@ class CameraDeviceBase : public virtual FrameProducer {
 
     virtual status_t initialize(sp<CameraProviderManager> manager,
             const std::string& monitorTags) = 0;
+    // Set before initialization for non-shared clients. The default keeps other
+    // device implementations source-compatible; it does not enable tag injection.
+    virtual void setSessionClientPackageName(const std::string& /*packageName*/) {}
+
     virtual status_t disconnect() = 0;
     virtual status_t disconnectClient(int) {return OK;};
 
