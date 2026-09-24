@@ -45,8 +45,21 @@ namespace {
 void appendToBuffer(const void* data,
                     size_t size,
                     std::vector<uint8_t>* buffer) {
+    if (size == 0) return;
     const uint8_t* p = reinterpret_cast<const uint8_t*>(data);
     buffer->insert(buffer->end(), p, p + size);
+}
+
+// Respect the same effect parameter bound as AudioFlinger. Compute in a wider
+// type so malformed sizes cannot wrap before allocation or response validation.
+// Parameter/value payloads are byte arrays; only their boundary is aligned.
+bool getParameterSize(const effect_param_t& param, size_t* size) {
+    if (param.psize == 0 || param.vsize == 0) return false;
+    const uint64_t offset = (uint64_t{param.psize} + 3u) & ~uint64_t{3u};
+    const uint64_t total = sizeof(effect_param_t) + offset + param.vsize;
+    if (total > EFFECT_PARAM_SIZE_MAX) return false;
+    *size = static_cast<size_t>(total);
+    return true;
 }
 
 }  // namespace
@@ -413,31 +426,31 @@ status_t AudioEffect::setParameter(effect_param_t *param)
         return (mStatus == ALREADY_EXISTS) ? (status_t) INVALID_OPERATION : mStatus;
     }
 
-    if (param == nullptr || param->psize == 0 || param->vsize == 0) {
+    size_t requestSize;
+    if (param == nullptr || !getParameterSize(*param, &requestSize)) {
         return BAD_VALUE;
     }
 
-    uint32_t psize = ((param->psize - 1) / sizeof(int) + 1) * sizeof(int) + param->vsize;
-
-    ALOGV("setParameter: param: %d, param2: %d", *(int *)param->data,
-            (param->psize == 8) ? *((int *)param->data + 1): -1);
+    ALOGV("setParameter: psize=%u vsize=%u", param->psize, param->vsize);
 
     std::vector<uint8_t> cmd;
-    appendToBuffer(param, sizeof(effect_param_t) + psize, &cmd);
+    appendToBuffer(param, requestSize, &cmd);
     std::vector<uint8_t> response;
-    status_t status;
+    status_t status = NO_INIT;
     Status bs = mIEffect->command(EFFECT_CMD_SET_PARAM,
                                   cmd,
-                                  sizeof(int),
+                                  sizeof(status_t),
                                   &response,
                                   &status);
     if (!bs.isOk()) {
-        status = statusTFromBinderStatus(bs);
-        return status;
+        return statusTFromBinderStatus(bs);
     }
-    assert(response.size() == sizeof(int));
-    memcpy(&param->status, response.data(), response.size());
-    return status;
+    // AudioFlinger returns no reply when the effect command fails. Preserve
+    // that error for the caller's recovery path, rather than asserting first.
+    if (status != NO_ERROR) return status;
+    if (response.size() != sizeof(status_t)) return BAD_VALUE;
+    memcpy(&param->status, response.data(), sizeof(param->status));
+    return NO_ERROR;
 }
 
 status_t AudioEffect::setParameterDeferred(effect_param_t *param)
@@ -503,28 +516,47 @@ status_t AudioEffect::getParameter(effect_param_t *param)
     if (mStatus != NO_ERROR && mStatus != ALREADY_EXISTS) {
         return mStatus;
     }
-    if (param == nullptr || param->psize == 0 || param->vsize == 0) {
+
+    size_t capacity;
+    if (param == nullptr || !getParameterSize(*param, &capacity)) {
         return BAD_VALUE;
     }
 
-    ALOGV("getParameter: param: %d, param2: %d", *(int *)param->data,
-            (param->psize == 8) ? *((int *)param->data + 1): -1);
+    ALOGV("getParameter: psize=%u vsize=%u", param->psize, param->vsize);
 
-    uint32_t psize = sizeof(effect_param_t) + ((param->psize - 1) / sizeof(int) + 1) * sizeof(int) +
-            param->vsize;
-
-    status_t status;
+    status_t status = NO_INIT;
     std::vector<uint8_t> cmd;
     std::vector<uint8_t> response;
     appendToBuffer(param, sizeof(effect_param_t) + param->psize, &cmd);
 
-    Status bs = mIEffect->command(EFFECT_CMD_GET_PARAM, cmd, psize, &response, &status);
-    if (!bs.isOk()) {
-        status = statusTFromBinderStatus(bs);
-        return status;
+    Status bs = mIEffect->command(EFFECT_CMD_GET_PARAM, cmd,
+                                  static_cast<int32_t>(capacity), &response, &status);
+    if (!bs.isOk()) return statusTFromBinderStatus(bs);
+    if (status != NO_ERROR) return status;
+    if (response.size() < sizeof(effect_param_t) || response.size() > capacity) {
+        return BAD_VALUE;
     }
-    memcpy(param, response.data(), response.size());
-    return status;
+
+    effect_param_t header;
+    memcpy(&header, response.data(), sizeof(header));
+    if (header.psize != param->psize || header.vsize > param->vsize
+            || header.psize > response.size() - sizeof(header)
+            || memcmp(response.data() + sizeof(header), param->data, header.psize) != 0) {
+        return BAD_VALUE;
+    }
+    // An effect-level error need not carry a value. Do not expose uninitialized
+    // bytes as successful readback or change the caller's allocation contract.
+    if (header.status != NO_ERROR) {
+        param->status = header.status;
+        return NO_ERROR;
+    }
+
+    size_t required;
+    if (!getParameterSize(header, &required) || required > response.size()) {
+        return BAD_VALUE;
+    }
+    memcpy(param, response.data(), required);
+    return NO_ERROR;
 }
 
 status_t AudioEffect::getConfigs(
@@ -606,14 +638,20 @@ void AudioEffect::commandExecuted(int32_t cmdCode,
                                   const std::vector<uint8_t>& cmdData,
                                   const std::vector<uint8_t>& replyData)
 {
-    if (cmdData.empty() || replyData.empty()) {
+    if (cmdCode != EFFECT_CMD_SET_PARAM || cmdData.size() < sizeof(effect_param_t)
+            || replyData.size() != sizeof(status_t)) {
         return;
     }
+    effect_param_t header;
+    memcpy(&header, cmdData.data(), sizeof(header));
+    size_t required;
+    if (!getParameterSize(header, &required) || required > cmdData.size()) return;
+
     auto cb = mCallback.promote();
-    if (cb != nullptr && cmdCode == EFFECT_CMD_SET_PARAM) {
+    if (cb != nullptr) {
         std::vector<uint8_t> cmdDataCopy(cmdData);
-        effect_param_t* cmd = reinterpret_cast<effect_param_t *>(cmdDataCopy.data());
-        cmd->status = *reinterpret_cast<const int32_t *>(replyData.data());
+        auto* cmd = reinterpret_cast<effect_param_t*>(cmdDataCopy.data());
+        memcpy(&cmd->status, replyData.data(), sizeof(cmd->status));
         cb->onParameterChanged(std::move(cmdDataCopy));
     }
 }
