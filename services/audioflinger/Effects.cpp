@@ -22,6 +22,7 @@
 #include "Effects.h"
 
 #include "Client.h"
+#include "DolbyDapController.h"
 #include "EffectConfiguration.h"
 
 #include <afutils/FallibleLockGuard.h>
@@ -1531,7 +1532,7 @@ status_t EffectModule::setOffloaded_l(bool offloaded, audio_io_handle_t io)
     }
     status_t status = NO_ERROR;
     if ((mDescriptor.flags & EFFECT_FLAG_OFFLOAD_SUPPORTED) != 0) {
-        status_t cmdStatus;
+        status_t cmdStatus = NO_INIT;
         uint32_t size = sizeof(status_t);
         effect_offload_param_t cmd;
 
@@ -1543,7 +1544,7 @@ status_t EffectModule::setOffloaded_l(bool offloaded, audio_io_handle_t io)
                                            &size,
                                            &cmdStatus);
         if (status == NO_ERROR) {
-            status = cmdStatus;
+            status = size == sizeof(cmdStatus) ? cmdStatus : BAD_VALUE;
         }
         mOffloaded = (status == NO_ERROR) ? offloaded : false;
     } else {
@@ -2616,6 +2617,7 @@ size_t EffectChain::removeEffect(const sp<IAfEffectModule>& effect,
                 mEffects[i]->stop_l();
             }
             if (release) {
+                DolbyDapController::getInstance().effectReleased(mEffects[i]);
                 mEffects[i]->release_l("EffectChain::removeEffect");
             }
             // Skip operation when no thread attached (could lead to sigfpe as framecount is 0...)

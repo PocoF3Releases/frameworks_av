@@ -71,6 +71,7 @@ cc_library {
     name: "libaudiopolicyservice",
 
     defaults: [
+        "legacy_dap_integration_defaults",
         "libaudiopolicyservice_dependencies",
     ],
 

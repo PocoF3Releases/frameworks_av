@@ -598,6 +598,14 @@ public:
         return !mEffects.empty() && id == mEffects[0]->id();
     }
 
+    bool containsEffect_l(const sp<IAfEffectModule>& effect) const final
+            REQUIRES(audio_utils::EffectChain_Mutex) {
+        for (const auto& candidate : mEffects) {
+            if (candidate == effect) return true;
+        }
+        return false;
+    }
+
     void dump(int fd, const Vector<String16>& args) const final;
 
     size_t numberOfEffects() const final {
