@@ -116,6 +116,7 @@ class Camera3Device :
      */
 
     const std::string& getId() const override;
+    void setSessionClientPackageName(const std::string& packageName) override;
 
     metadata_vendor_id_t getVendorTagId() const override { return mVendorTagId; }
 
@@ -467,6 +468,10 @@ class Camera3Device :
 
     // Camera device ID
     const std::string          mId;
+
+    // Bound to this client before initialization; guarded by mLock. Shared
+    // devices deliberately leave this unset rather than borrowing an identity.
+    std::string                mSessionClientPackageName;
 
     // Legacy camera client flag
     bool                       mLegacyClient;

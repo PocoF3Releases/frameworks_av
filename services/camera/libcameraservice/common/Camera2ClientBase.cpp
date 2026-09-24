@@ -155,6 +155,13 @@ status_t Camera2ClientBase<TClientBase>::initializeImpl(TProviderPtr providerPtr
         return res;
     }
 
+    // A different (even rejected) connect attempt must not change the identity
+    // used by this device's later stream configurations. A shared device has
+    // several clients, so there is no single package to synthesize for it.
+    if (!TClientBase::mSharedMode) {
+        mDevice->setSessionClientPackageName(TClientBase::getPackageName());
+    }
+
     res = mDevice->initialize(providerPtr, monitorTags);
     if (res != OK) {
         ALOGE("%s: Camera %s: unable to initialize device: %s (%d)",
