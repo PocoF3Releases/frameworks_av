@@ -587,7 +587,7 @@ void DolbyDapController::dump(int fd) const {
     property_get(kDolbyVersionProperty, version, "unset");
     std::ostringstream output;
     output << "\nDolby DAP controller (bookkeeping; not DSP readback):\n"
-           << "  support=" << property_get_bool(kDolbySupportProperty, false)
+           << "  support=" << static_cast<bool>(property_get_bool(kDolbySupportProperty, false))
            << " control=" << control << " version=" << version << "\n";
     {
         std::unique_lock lock(mMutex, std::try_to_lock);
