@@ -2763,6 +2763,20 @@ std::vector<std::string> Codec2Client::CacheServiceNames() {
         } else {
             LOG(FATAL) << "C2 AIDL cannot be selected on Android version older than 35";
         }
+        // Also list legacy HIDL stores (e.g. Dolby Vision), tagged so they
+        // can be told apart from AIDL ones in _CreateFromIndex().
+        using ::android::hardware::media::c2::V1_0::IComponentStore;
+        using ::android::hidl::manager::V1_2::IServiceManager;
+        sp<IServiceManager> serviceManager = IServiceManager::getService();
+        if (serviceManager) {
+            serviceManager->listManifestByInterface(
+                    IComponentStore::descriptor,
+                    [&names](hidl_vec<hidl_string> const& instanceNames) {
+                        for (auto const& n : instanceNames) {
+                            names.emplace_back(std::string("hidl/") + n.c_str());
+                        }
+                    });
+        }
     } else {
         // Get HIDL service names
         using ::android::hardware::media::c2::V1_0::IComponentStore;
@@ -2876,7 +2890,7 @@ std::shared_ptr<Codec2Client> Codec2Client::_CreateFromIndex(size_t index) {
         } else {
             LOG(FATAL) << "ApexCodecs not supported on Android version older than 36";
         }
-    } else if (c2_aidl::utils::IsSelected()) {
+    } else if (c2_aidl::utils::IsSelected() && name.compare(0, 5, "hidl/") != 0) {
         if (__builtin_available(android __ANDROID_API_S__, *)) {
             std::string instanceName =
                 ::android::base::StringPrintf("%s/%s", AidlBase::descriptor, name.c_str());
@@ -2898,8 +2912,12 @@ std::shared_ptr<Codec2Client> Codec2Client::_CreateFromIndex(size_t index) {
             LOG(FATAL) << "C2 AIDL cannot be selected on Android version older than 35";
         }
     } else {
-        std::string instanceName = "android.hardware.media.c2/" + name;
-        sp<HidlBase> baseStore = HidlBase::getService(name);
+        std::string hidlName = name.compare(0, 5, "hidl/") == 0 ? name.substr(5) : name;
+        sp<HidlBase> baseStore = HidlBase::getService(hidlName);
+        if (!baseStore && c2_aidl::utils::IsSelected()) {
+            LOG(ERROR) << "Codec2 HIDL service \"" << hidlName << "\" unavailable";
+            return nullptr;
+        }
         CHECK(baseStore) << "Codec2 service \"" << name << "\""
                             " inaccessible for unknown reasons.";
         LOG(VERBOSE) << "Client to Codec2 service \"" << name << "\" created";
