@@ -223,6 +223,10 @@ public:
     status_t setAudioSource(audio_source_t source) final EXCLUDES_EffectBase_Mutex;
     status_t start_l() final REQUIRES(audio_utils::EffectChain_Mutex) EXCLUDES_EffectBase_Mutex;
     status_t stop_l() final REQUIRES(audio_utils::EffectChain_Mutex) EXCLUDES_EffectBase_Mutex;
+    status_t stopForMove_l(bool* preserved) final
+            REQUIRES(audio_utils::EffectChain_Mutex) EXCLUDES_EffectBase_Mutex;
+    status_t stopAfterFailedMove_l() final
+            REQUIRES(audio_utils::EffectChain_Mutex) EXCLUDES_EffectBase_Mutex;
 
     status_t setOffloaded_l(bool offloaded, audio_io_handle_t io) final
             REQUIRES(audio_utils::EffectChain_Mutex) EXCLUDES_EffectBase_Mutex;
@@ -262,7 +266,9 @@ private:
     DISALLOW_COPY_AND_ASSIGN(EffectModule);
 
     status_t start_ll() REQUIRES(audio_utils::EffectChain_Mutex, audio_utils::EffectBase_Mutex);
-    status_t stop_ll() REQUIRES(audio_utils::EffectChain_Mutex, audio_utils::EffectBase_Mutex);
+    enum class StopReason { Normal, Move, AbortMove };
+    status_t stop_ll(StopReason reason = StopReason::Normal, bool* preserved = nullptr)
+            REQUIRES(audio_utils::EffectChain_Mutex, audio_utils::EffectBase_Mutex);
     status_t removeEffectFromHal_l() override REQUIRES(audio_utils::EffectChain_Mutex);
     status_t sendSetAudioDevicesCommand(const AudioDeviceTypeAddrVector &devices, uint32_t cmdCode);
     effect_buffer_access_e requiredEffectBufferAccessMode() const {
@@ -489,6 +495,8 @@ public:
             REQUIRES(audio_utils::EffectChain_Mutex);
     size_t removeEffect(const sp<IAfEffectModule>& handle, bool release = false) final
             EXCLUDES_EffectChain_Mutex;
+    size_t removeEffectForMove(const sp<IAfEffectModule>& effect, bool* preserved) final
+            EXCLUDES_EffectChain_Mutex;
 
     audio_session_t sessionId() const final { return mSessionId; }
     void setSessionId(audio_session_t sessionId) final { mSessionId = sessionId; }
@@ -625,6 +633,8 @@ public:
     void setThread(const sp<IAfThreadBase>& thread) final EXCLUDES_EffectChain_Mutex;
 
   private:
+    size_t removeEffectImpl(const sp<IAfEffectModule>& effect, bool release,
+            bool forMove, bool* preserved) EXCLUDES_EffectChain_Mutex;
     bool setVolume_l(uint32_t* left, uint32_t* right, bool force = false)
             REQUIRES(audio_utils::EffectChain_Mutex);
 

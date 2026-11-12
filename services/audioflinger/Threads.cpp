@@ -1885,7 +1885,18 @@ status_t ThreadBase::addEffect_ll(const sp<IAfEffectModule>& effect)
 }
 
 void ThreadBase::removeEffect_l(const sp<IAfEffectModule>& effect, bool release) {
+    removeEffectImpl_l(effect, release, false /* forMove */, nullptr);
+}
 
+void ThreadBase::removeEffectForMove_l(const sp<IAfEffectModule>& effect, bool* preserved) {
+    removeEffectImpl_l(effect, false /* release */, true /* forMove */, preserved);
+}
+
+void ThreadBase::removeEffectImpl_l(const sp<IAfEffectModule>& effect, bool release,
+        bool forMove, bool* preserved) {
+    if (preserved != nullptr) {
+        *preserved = false;
+    }
     ALOGV("%s %p effect %p", __FUNCTION__, this, effect.get());
     effect_descriptor_t desc = effect->desc();
     if ((desc.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_AUXILIARY) {
@@ -1895,7 +1906,10 @@ void ThreadBase::removeEffect_l(const sp<IAfEffectModule>& effect, bool release)
     sp<IAfEffectChain> chain = effect->getCallback()->chain().promote();
     if (chain != 0) {
         // remove effect chain if removing last effect
-        if (chain->removeEffect(effect, release) == 0) {
+        const size_t remaining = forMove && !release
+                ? chain->removeEffectForMove(effect, preserved)
+                : chain->removeEffect(effect, release);
+        if (remaining == 0) {
             removeEffectChain_l(chain);
         }
     } else {

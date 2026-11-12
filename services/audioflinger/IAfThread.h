@@ -458,6 +458,12 @@ public:
     virtual sp<IAfPlaybackThread> asIAfPlaybackThread() { return nullptr; }
     virtual sp<IAfRecordThread> asIAfRecordThread() { return nullptr; }
     virtual IAfThreadCallback* afThreadCallback() const = 0;
+
+    virtual void removeEffectForMove_l(const sp<IAfEffectModule>& effect, bool* preserved)
+            REQUIRES(mutex()) {
+        *preserved = false;
+        removeEffect_l(effect);
+    }
 };
 
 class IAfPlaybackThread : public virtual IAfThreadBase {

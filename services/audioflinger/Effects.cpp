@@ -28,6 +28,7 @@
 #include <afutils/FallibleLockGuard.h>
 #include <audio_utils/channels.h>
 #include <audio_utils/primitives.h>
+#include <cutils/properties.h>
 #include <media/AudioCommonTypes.h>
 #include <media/AudioContainers.h>
 #include <media/AudioDeviceTypeAddr.h>
@@ -76,6 +77,11 @@ using audioflinger::EffectConfiguration;
 using binder::Status;
 
 namespace {
+
+constexpr effect_uuid_t kMiSoundType =
+        {0xf46b26a0, 0xdddd, 0x11db, 0x8afd, {0x00, 0x02, 0xa5, 0xd5, 0xc5, 0x1b}};
+constexpr effect_uuid_t kMiSoundUuid =
+        {0x5b8e36a5, 0x144a, 0x4c38, 0xb1d7, {0x00, 0x02, 0xa5, 0xd5, 0xc5, 0x1b}};
 
 // Append a POD value into a vector of bytes.
 template<typename T>
@@ -1108,12 +1114,29 @@ status_t EffectModule::stop_l()
     return stop_ll();
 }
 
-status_t EffectModule::stop_ll()
+status_t EffectModule::stopForMove_l(bool* preserved)
 {
+    audio_utils::lock_guard _l(mutex());
+    return stop_ll(StopReason::Move, preserved);
+}
+
+status_t EffectModule::stopAfterFailedMove_l()
+{
+    audio_utils::lock_guard _l(mutex());
+    return stop_ll(StopReason::AbortMove);
+}
+
+status_t EffectModule::stop_ll(StopReason reason, bool* preserved)
+{
+    if (preserved != nullptr) {
+        *preserved = false;
+    }
     if (mEffectInterface == 0) {
         return NO_INIT;
     }
-    if (mStatus != NO_ERROR) {
+    // A failed destination/source configuration must not prevent a real native stop
+    // when aborting an activation preserved earlier in this move. Keep mStatus intact.
+    if (mStatus != NO_ERROR && reason != StopReason::AbortMove) {
         return mStatus;
     }
     status_t cmdStatus = NO_ERROR;
@@ -1127,13 +1150,29 @@ status_t EffectModule::stop_ll()
         mSetVolumeReentrantTid = INVALID_PID;
     }
 
-    status_t status = mEffectInterface->command(EFFECT_CMD_DISABLE,
-                                                0,
-                                                NULL,
-                                                &size,
-                                                &cmdStatus);
-    if (status == NO_ERROR) {
-        status = cmdStatus;
+    // This legacy implementation resets the selected scene on DISABLE, even when the
+    // framework is only moving an active output-mix effect. Keep the engine enabled for
+    // that synthetic stop, but retain HAL detachment and the ordinary Off/release path.
+    // Check ACTIVE here under the effect mutex so a concurrent requested Off wins.
+    const bool preserve = reason == StopReason::Move && mState == ACTIVE
+            && mSessionId == AUDIO_SESSION_OUTPUT_MIX && isOffloadable()
+            && memcmp(&mDescriptor.type, &kMiSoundType, sizeof(effect_uuid_t)) == 0
+            && memcmp(&mDescriptor.uuid, &kMiSoundUuid, sizeof(effect_uuid_t)) == 0
+            && property_get_bool("ro.vendor.audio.misound.preserve_on_move", false);
+    status_t status = NO_ERROR;
+    if (preserve) {
+        if (preserved != nullptr) {
+            *preserved = true;
+        }
+    } else {
+        status = mEffectInterface->command(EFFECT_CMD_DISABLE,
+                                          0,
+                                          NULL,
+                                          &size,
+                                          &cmdStatus);
+        if (status == NO_ERROR) {
+            status = cmdStatus;
+        }
     }
     if (status == NO_ERROR) {
         status = removeEffectFromHal_l();
@@ -2599,10 +2638,23 @@ ssize_t EffectChain::getInsertIndex_l(const effect_descriptor_t& desc) {
     return idx_insert;
 }
 
-size_t EffectChain::removeEffect(const sp<IAfEffectModule>& effect,
-                                                 bool release)
+size_t EffectChain::removeEffect(const sp<IAfEffectModule>& effect, bool release)
+{
+    return removeEffectImpl(effect, release, false /* forMove */, nullptr);
+}
+
+size_t EffectChain::removeEffectForMove(const sp<IAfEffectModule>& effect, bool* preserved)
+{
+    return removeEffectImpl(effect, false /* release */, true /* forMove */, preserved);
+}
+
+size_t EffectChain::removeEffectImpl(const sp<IAfEffectModule>& effect, bool release,
+        bool forMove, bool* preserved)
 {
     audio_utils::lock_guard _l(mutex());
+    if (preserved != nullptr) {
+        *preserved = false;
+    }
     size_t size = mEffects.size();
     uint32_t type = effect->desc().flags & EFFECT_FLAG_TYPE_MASK;
 
@@ -2614,7 +2666,11 @@ size_t EffectChain::removeEffect(const sp<IAfEffectModule>& effect,
             // the middle of a read from audio HAL
             if (mEffects[i]->state() == EffectModule::ACTIVE ||
                     mEffects[i]->state() == EffectModule::STOPPING) {
-                mEffects[i]->stop_l();
+                if (forMove && !release) {
+                    mEffects[i]->stopForMove_l(preserved);
+                } else {
+                    mEffects[i]->stop_l();
+                }
             }
             if (release) {
                 DolbyDapController::getInstance().effectReleased(mEffects[i]);

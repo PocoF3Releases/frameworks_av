@@ -465,6 +465,8 @@ public:
                 // effect
     void removeEffect_l(const sp<IAfEffectModule>& effect, bool release = false) final
             REQUIRES(mutex());
+    void removeEffectForMove_l(const sp<IAfEffectModule>& effect, bool* preserved) final
+            REQUIRES(mutex());
                 // disconnect an effect handle from module and destroy module if last handle
     void disconnectEffectHandle(IAfEffectHandle* handle, bool unpinIfLast) final;
                 // detach all tracks connected to an auxiliary effect
@@ -661,6 +663,9 @@ public:
 // TODO(b/291317898) organize with publics
    product_strategy_t getStrategyForStream(audio_stream_type_t stream, uid_t uid) const;
 protected:
+
+    void removeEffectImpl_l(const sp<IAfEffectModule>& effect, bool release,
+            bool forMove, bool* preserved) REQUIRES(mutex());
 
     virtual void onHalLatencyModesChanged_l() REQUIRES(mutex()) {}
 

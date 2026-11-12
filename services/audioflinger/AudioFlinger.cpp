@@ -4792,7 +4792,11 @@ status_t AudioFlinger::moveEffectChain_ll(audio_session_t sessionId,
     // transfer all effects one by one so that new effect chain is created on new thread with
     // correct buffer sizes and audio parameters and effect engines reconfigured accordingly
     sp<IAfEffectChain> dstChain;
-    std::vector<sp<IAfEffectModule>> removed;
+    struct RemovedEffect {
+        sp<IAfEffectModule> effect;
+        bool preserved;
+    };
+    std::vector<RemovedEffect> removed;
     status_t status = NO_ERROR;
     std::string errorString;
     // process effects one by one.
@@ -4804,12 +4808,13 @@ status_t AudioFlinger::moveEffectChain_ll(audio_session_t sessionId,
             dolby.skipHardBypass();
         }
 
+        bool preserved = false;
         if (srcThread != nullptr) {
-            srcThread->removeEffect_l(effect);
+            srcThread->removeEffectForMove_l(effect, &preserved);
         } else {
-            chain->removeEffect(effect);
+            chain->removeEffectForMove(effect, &preserved);
         }
-        removed.push_back(effect);
+        removed.push_back({effect, preserved});
         status = dstThread->addEffect_ll(effect);
         if (status != NO_ERROR) {
             errorString = StringPrintf(
@@ -4833,14 +4838,23 @@ status_t AudioFlinger::moveEffectChain_ll(audio_session_t sessionId,
     size_t restored = 0;
     if (status != NO_ERROR) {
         dstChain.clear(); // dstChain is now from the srcThread (could be recreated).
-        for (const auto& effect : removed) {
-            dstThread->removeEffect_l(effect); // Note: Depending on error location, the last
-                                               // effect may not have been placed on dstThread.
+        for (auto& [effect, preserved] : removed) {
+            // Depending on the error location, the last effect may not be on dstThread.
+            bool preservedOnRollback = false;
+            dstThread->removeEffectForMove_l(effect, &preservedOnRollback);
+            preserved |= preservedOnRollback;
             if (srcThread != nullptr && srcThread->addEffect_ll(effect) == NO_ERROR) {
                 ++restored;
                 if (dstChain == nullptr) {
                     dstChain = effect->getCallback()->chain().promote();
                 }
+            } else if (preserved) {
+                // No output will restart this engine. End the preserved native activation
+                // with a real stop; this state is local to the move, never a one-shot flag.
+                audio_utils::lock_guard _cl(chain->mutex());
+                const status_t stopStatus = effect->stopAfterFailedMove_l();
+                ALOGW_IF(stopStatus != NO_ERROR, "%s: cannot stop detached effect %p: %d",
+                        __func__, effect.get(), stopStatus);
             }
         }
     }
@@ -4853,9 +4867,10 @@ status_t AudioFlinger::moveEffectChain_ll(audio_session_t sessionId,
         // while we are starting the effect.  This can cause glitches with volume,
         // see b/202360137.
         dstChain->mutex().lock();
-        for (const auto& effect : removed) {
-            if (effect->state() == IAfEffectModule::ACTIVE ||
-                    effect->state() == IAfEffectModule::STOPPING) {
+        for (const auto& [effect, preserved] : removed) {
+            if (dstChain->containsEffect_l(effect)
+                    && (effect->state() == IAfEffectModule::ACTIVE ||
+                        effect->state() == IAfEffectModule::STOPPING)) {
                 ++started;
                 effect->start_l();
             }

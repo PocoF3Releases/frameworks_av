@@ -217,6 +217,17 @@ private:
     virtual void addEffectToHal_l() = 0;
     virtual status_t removeEffectFromHal_l() = 0;
     virtual void release_l(const std::string& from) = 0;
+
+    // A move preserves framework activation. Report only an actually omitted native stop
+    // so a failed move can perform an ordinary stop before leaving the engine detached.
+    virtual status_t stopForMove_l(bool* preserved) {
+        *preserved = false;
+        return stop_l();
+    }
+
+public:
+    // Only for an actually preserved activation that cannot be attached or restored.
+    virtual status_t stopAfterFailedMove_l() { return stop_l(); }
 };
 
 class IAfEffectChain : public RefBase {
@@ -357,6 +368,12 @@ public:
                                         spatializedMetadata) = 0;
 
     virtual void dump(int fd, const Vector<String16>& args) const = 0;
+
+    virtual size_t removeEffectForMove(const sp<IAfEffectModule>& effect, bool* preserved)
+            EXCLUDES_EffectChain_Mutex {
+        *preserved = false;
+        return removeEffect(effect);
+    }
 };
 
 class IAfEffectHandle : public virtual RefBase {
